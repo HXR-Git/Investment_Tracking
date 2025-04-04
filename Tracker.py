@@ -9,6 +9,7 @@ import requests
 import numpy as np
 import time
 import os
+import hashlib  # For password hashing
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="Stock Portfolio Tracker")
@@ -39,7 +40,6 @@ custom_template = {
 # --- Database Setup ---
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
-    #  postgresql://postgres:ljndPuNyttPpSrAZCFVRQaGkAEViJuWU@crossover.proxy.rlwy.net:43960/railway
     if not database_url:
         st.error("DATABASE_URL not set. Please configure it in your environment.")
         return None
@@ -56,17 +56,91 @@ def init_db():
         return
     try:
         c = conn.cursor()
+        # Users table for authentication
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+                     (username TEXT PRIMARY KEY, password TEXT, clear_password TEXT)''')
+        # Transactions, stocks, and broker_transactions now include username
         c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                     (stock_name TEXT, symbol TEXT, transaction_type TEXT, exchange TEXT,
+                     (username TEXT, stock_name TEXT, symbol TEXT, transaction_type TEXT, exchange TEXT,
                       purchase_date TEXT, purchase_price REAL, quantity REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS stocks
-                     (stock_name TEXT, symbol TEXT UNIQUE, exchange TEXT,
-                      purchase_price REAL, quantity REAL, total_cost REAL)''')
+                     (username TEXT, stock_name TEXT, symbol TEXT, exchange TEXT,
+                      purchase_price REAL, quantity REAL, total_cost REAL,
+                      CONSTRAINT unique_user_symbol UNIQUE (username, symbol))''')
         c.execute('''CREATE TABLE IF NOT EXISTS broker_transactions
-                     (transaction_type TEXT, date TEXT, amount REAL)''')
+                     (username TEXT, transaction_type TEXT, date TEXT, amount REAL)''')
         conn.commit()
     except Exception as e:
         st.error(f"Database initialization failed: {str(e)}")
+    finally:
+        conn.close()
+
+# --- Authentication Functions ---
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def register_user(username, password):
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        c = conn.cursor()
+        c.execute("SELECT username FROM users WHERE username=%s", (username,))
+        if c.fetchone():
+            st.error("Username already exists.")
+            return False
+        hashed_password = hash_password(password)
+        c.execute("INSERT INTO users (username, password, clear_password) VALUES (%s, %s, %s)",
+                  (username, hashed_password, None))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error registering user: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def login_user(username, password):
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        c = conn.cursor()
+        c.execute("SELECT password FROM users WHERE username=%s", (username,))
+        result = c.fetchone()
+        if result and result[0] == hash_password(password):
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error logging in: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def set_clear_password(username, clear_password):
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE users SET clear_password=%s WHERE username=%s", (clear_password, username))
+        conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error setting clear password: {str(e)}")
+        return False
+    finally:
+        conn.close()
+
+def get_clear_password(username):
+    conn = get_db_connection()
+    if conn is None:
+        return None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT clear_password FROM users WHERE username=%s", (username,))
+        result = c.fetchone()
+        return result[0] if result else None
     finally:
         conn.close()
 
@@ -336,13 +410,13 @@ def calculate_correlation_matrix(df_valid):
     return None
 
 # --- Database Operations ---
-def update_stocks(stock_name, symbol, exchange, transaction_type, purchase_price, quantity):
+def update_stocks(username, stock_name, symbol, exchange, transaction_type, purchase_price, quantity):
     conn = get_db_connection()
     if conn is None:
         return False
     try:
         c = conn.cursor()
-        c.execute("SELECT quantity, purchase_price, total_cost FROM stocks WHERE symbol=%s", (symbol,))
+        c.execute("SELECT quantity, purchase_price, total_cost FROM stocks WHERE username=%s AND symbol=%s", (username, symbol))
         existing = c.fetchone()
 
         if existing:
@@ -351,24 +425,24 @@ def update_stocks(stock_name, symbol, exchange, transaction_type, purchase_price
                 new_quantity = existing_quantity + quantity
                 new_total_cost = existing_cost + (purchase_price * quantity)
                 new_avg_price = new_total_cost / new_quantity if new_quantity > 0 else 0
-                c.execute("UPDATE stocks SET stock_name=%s, exchange=%s, purchase_price=%s, quantity=%s, total_cost=%s WHERE symbol=%s",
-                          (stock_name, exchange, new_avg_price, new_quantity, new_total_cost, symbol))
+                c.execute("UPDATE stocks SET stock_name=%s, exchange=%s, purchase_price=%s, quantity=%s, total_cost=%s WHERE username=%s AND symbol=%s",
+                          (stock_name, exchange, new_avg_price, new_quantity, new_total_cost, username, symbol))
             elif transaction_type == "Sell":
                 if existing_quantity >= quantity:
                     new_quantity = existing_quantity - quantity
                     new_total_cost = existing_cost if new_quantity == 0 else existing_price * new_quantity
-                    c.execute("UPDATE stocks SET stock_name=%s, exchange=%s, purchase_price=%s, quantity=%s, total_cost=%s WHERE symbol=%s",
-                              (stock_name, exchange, existing_price, new_quantity, new_total_cost, symbol))
+                    c.execute("UPDATE stocks SET stock_name=%s, exchange=%s, purchase_price=%s, quantity=%s, total_cost=%s WHERE username=%s AND symbol=%s",
+                              (stock_name, exchange, existing_price, new_quantity, new_total_cost, username, symbol))
                     if new_quantity == 0:
-                        c.execute("DELETE FROM stocks WHERE symbol=%s", (symbol,))
+                        c.execute("DELETE FROM stocks WHERE username=%s AND symbol=%s", (username, symbol))
                 else:
                     st.error(f"Cannot sell {quantity} of {stock_name} ({symbol}) - Only {existing_quantity} available.")
                     return False
         else:
             if transaction_type == "Buy":
                 total_cost = purchase_price * quantity
-                c.execute("INSERT INTO stocks (stock_name, symbol, exchange, purchase_price, quantity, total_cost) VALUES (%s, %s, %s, %s, %s, %s)",
-                          (stock_name, symbol, exchange, purchase_price, quantity, total_cost))
+                c.execute("INSERT INTO stocks (username, stock_name, symbol, exchange, purchase_price, quantity, total_cost) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                          (username, stock_name, symbol, exchange, purchase_price, quantity, total_cost))
             else:
                 st.error(f"Cannot sell {stock_name} ({symbol}) - No existing position.")
                 return False
@@ -381,7 +455,7 @@ def update_stocks(stock_name, symbol, exchange, transaction_type, purchase_price
         conn.close()
 
 # --- Add Transaction Forms ---
-def add_stock_transaction_form():
+def add_stock_transaction_form(username):
     st.subheader("Add Stock Transaction")
     stock_query = st.text_input("Search Stock")
     symbol_options = []
@@ -428,10 +502,10 @@ def add_stock_transaction_form():
             if conn:
                 try:
                     c = conn.cursor()
-                    c.execute("INSERT INTO transactions (stock_name, symbol, transaction_type, exchange, purchase_date, purchase_price, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                              (stock_name, symbol, transaction_type, exchange, str(purchase_date), purchase_price, quantity))
+                    c.execute("INSERT INTO transactions (username, stock_name, symbol, transaction_type, exchange, purchase_date, purchase_price, quantity) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                              (username, stock_name, symbol, transaction_type, exchange, str(purchase_date), purchase_price, quantity))
                     conn.commit()
-                    if update_stocks(stock_name, symbol, exchange, transaction_type, purchase_price, quantity):
+                    if update_stocks(username, stock_name, symbol, exchange, transaction_type, purchase_price, quantity):
                         st.success(f"{transaction_type} of {stock_name} added.")
                         st.session_state.show_sidebar = False
                         st.rerun()
@@ -440,7 +514,7 @@ def add_stock_transaction_form():
                 finally:
                     conn.close()
 
-def add_broker_transaction_form():
+def add_broker_transaction_form(username):
     st.subheader("Add Broker Transaction")
     transaction_type = st.selectbox("Type", ["Deposit", "Withdraw"], key="broker_type")
     date = st.date_input("Date", max_value=datetime.today(), key="broker_date")
@@ -455,8 +529,8 @@ def add_broker_transaction_form():
             if conn:
                 try:
                     c = conn.cursor()
-                    c.execute("INSERT INTO broker_transactions (transaction_type, date, amount) VALUES (%s, %s, %s)",
-                              (transaction_type, str(date), amount))
+                    c.execute("INSERT INTO broker_transactions (username, transaction_type, date, amount) VALUES (%s, %s, %s, %s)",
+                              (username, transaction_type, str(date), amount))
                     conn.commit()
                     st.success(f"{transaction_type} of ₹{amount} added.")
                     st.session_state.show_sidebar = False
@@ -482,526 +556,612 @@ def color_fund(val):
 # --- Main App ---
 def main():
     init_db()
-    st.title("Stock Portfolio Tracker", anchor="top")
 
-    # Navigation with Add and Refresh Buttons
-    col1, col2, col3, col4, col5, col6, col7 = st.columns([1, 1, 1, 1, 1, 1, 0.5])
-    with col1:
-        dashboard_clicked = st.button("Dashboard")
-    with col2:
-        stock_activity_clicked = st.button("Stock Activity Ledger")
-    with col3:
-        fund_monitor_clicked = st.button("Fund Monitor")
-    with col4:
-        unrealized_pl_clicked = st.button("Unrealized P/L")
-    with col5:
-        realized_pl_clicked = st.button("Realized P/L")
-    with col6:
-        add_clicked = st.button("Add")
-    with col7:
-        if 'refreshing' not in st.session_state:
-            st.session_state.refreshing = False
-        refresh_clicked = st.button("🔄", key="refresh_button")
-        if refresh_clicked:
-            st.session_state.refreshing = True
-            with st.spinner("Refreshing data..."):
-                try:
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Refresh failed: {str(e)}")
-            st.session_state.refreshing = False
-
-    # CSS for spinning refresh button
-    st.markdown("""
-        <style>
-        button[kind="primary"][key="refresh_button"] {
-            transition: transform 0.5s;
-        }
-        button[kind="primary"][key="refresh_button"]:active {
-            transform: rotate(360deg);
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    # View and Sidebar State Management
+    # Session State Initialization
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'username' not in st.session_state:
+        st.session_state.username = None
+    if 'view_mode' not in st.session_state:
+        st.session_state.view_mode = False  # True for view-only mode
+    if 'view_username' not in st.session_state:
+        st.session_state.view_username = None
     if 'view' not in st.session_state:
         st.session_state.view = "Dashboard"
     if 'show_sidebar' not in st.session_state:
         st.session_state.show_sidebar = False
-
-    if dashboard_clicked:
-        st.session_state.view = "Dashboard"
-        st.session_state.show_sidebar = False
-    elif stock_activity_clicked:
-        st.session_state.view = "Stock Activity Ledger"
-        st.session_state.show_sidebar = False
-    elif fund_monitor_clicked:
-        st.session_state.view = "Fund Monitor"
-        st.session_state.show_sidebar = False
-    elif unrealized_pl_clicked:
-        st.session_state.view = "Unrealized P/L"
-        st.session_state.show_sidebar = False
-    elif realized_pl_clicked:
-        st.session_state.view = "Realized P/L"
-        st.session_state.show_sidebar = False
-    elif add_clicked:
-        current_state = st.session_state.show_sidebar
-        st.session_state.show_sidebar = not current_state
-
-    # Fetch Data
-    conn = get_db_connection()
-    if conn:
-        try:
-            df_stocks = pd.read_sql_query("SELECT * FROM stocks", conn)
-            df_transactions = pd.read_sql_query("SELECT * FROM transactions", conn)
-            df_broker = pd.read_sql_query("SELECT * FROM broker_transactions", conn)
-        except Exception as e:
-            st.error(f"Error fetching data: {str(e)}")
-            df_stocks = pd.DataFrame(columns=['stock_name', 'symbol', 'exchange', 'purchase_price', 'quantity', 'total_cost'])
-            df_transactions = pd.DataFrame(columns=['stock_name', 'symbol', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity'])
-            df_broker = pd.DataFrame(columns=['transaction_type', 'date', 'amount'])
-        finally:
-            conn.close()
-    else:
-        df_stocks = pd.DataFrame(columns=['stock_name', 'symbol', 'exchange', 'purchase_price', 'quantity', 'total_cost'])
-        df_transactions = pd.DataFrame(columns=['stock_name', 'symbol', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity'])
-        df_broker = pd.DataFrame(columns=['transaction_type', 'date', 'amount'])
-
-    # Sidebar with Add Dropdown
-    if st.session_state.show_sidebar:
-        with st.sidebar:
-            with st.expander("Add Transactions", expanded=True):
-                add_stock_transaction_form()
-                st.markdown("---")
-                add_broker_transaction_form()
-            st.write(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Password Setup for Clear All
-    if 'clear_password' not in st.session_state:
-        st.session_state.clear_password = None
     if 'is_unlocked' not in st.session_state:
         st.session_state.is_unlocked = False
 
-    if st.session_state.clear_password is None:
-        with st.form("set_password_form"):
-            new_password = st.text_input("Set a password to protect 'Clear All'", type="password")
-            if st.form_submit_button("Set Password"):
-                if new_password:
-                    st.session_state.clear_password = new_password
-                    st.success("Password set successfully!")
-                    st.rerun()
-                else:
-                    st.error("Password cannot be empty.")
+    # Landing Page
+    if not st.session_state.authenticated and not st.session_state.view_mode:
+        st.title("Stock Portfolio Tracker")
+        option = st.radio("Choose an option:", ("Sign In", "View Other Portfolio"))
 
-    # Color Mapping for Stocks
-    if not df_stocks.empty and 'symbol' in df_stocks.columns:
-        stock_colors = {symbol: px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
-                        for i, symbol in enumerate(df_stocks['symbol'].unique())}
-    else:
-        stock_colors = {}
+        if option == "Sign In":
+            with st.form("login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                col1, col2 = st.columns(2)
+                with col1:
+                    login_clicked = st.form_submit_button("Sign In")
+                with col2:
+                    register_clicked = st.form_submit_button("Register")
 
-    with st.container():
-        if st.session_state.view == "Dashboard":
-            if not df_stocks.empty:
-                df_current_stocks = df_stocks[df_stocks['quantity'] > 0].copy()
-                if not df_current_stocks.empty:
-                    with st.spinner("Updating Prices..."):
-                        prices = [fetch_data(symbol) for symbol in df_current_stocks['symbol']]
-                        df_current_stocks['current_price'] = prices
+                if login_clicked:
+                    if login_user(username, password):
+                        st.session_state.authenticated = True
+                        st.session_state.username = username
+                        st.success(f"Welcome, {username}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+                if register_clicked:
+                    if username and password:
+                        if register_user(username, password):
+                            st.success("Registered successfully! Please sign in.")
+                        else:
+                            st.error("Registration failed.")
+                    else:
+                        st.error("Enter both username and password.")
 
-                    df_valid = df_current_stocks.dropna(subset=['current_price']).copy()
-                    if not df_valid.empty:
-                        df_valid['value'] = df_valid['current_price'] * df_valid['quantity']
-                        df_valid['unrealized_pl'] = (df_valid['current_price'] - df_valid['purchase_price']) * df_valid['quantity']
-                        df_valid['return_percentage'] = df_valid.apply(
-                            lambda row: (row['unrealized_pl'] / row['total_cost'] * 100) if row['total_cost'] > 0 else 0, axis=1)
-                        df_valid['sector'] = [yf.Ticker(symbol).info.get('sector', 'Unknown') for symbol in df_valid['symbol']]
-
-                        total_investment = df_valid['total_cost'].sum()
-                        total_value = df_valid['value'].sum()
-                        total_unrealized_pl = df_valid['unrealized_pl'].sum()
-                        realized_pl = calculate_realized_profit_loss(df_transactions)
-                        one_day_change, one_day_change_pct = calculate_one_day_change(df_valid)
-
-                        # Metrics
-                        col1, col2, col3, col4, col5 = st.columns(5)
-                        col1.metric("Total Investment", f"₹{total_investment:.2f}")
-                        col2.metric("Current Value", f"₹{total_value:.2f}")
-                        col3.metric("1-Day Change", f"₹{one_day_change:.2f}" if one_day_change is not None else "N/A",
-                                    f"{one_day_change_pct:.2f}%" if one_day_change_pct is not None else "N/A",
-                                    delta_color="normal" if one_day_change is None or one_day_change >= 0 else "inverse")
-                        col4.metric("Return", f"₹{total_unrealized_pl:.2f}",
-                                    f"{(total_unrealized_pl / total_investment) * 100:.2f}%" if total_investment > 0 else "N/A")
-                        col5.metric("Realized P/L", f"₹{realized_pl:.2f}")
-
-                        # Graphs
-                        col1, col2 = st.columns(2)
-
-                        # Graph 1: Portfolio Allocation
-                        with col1:
-                            st.subheader("Portfolio Allocation")
-                            allocation_type = st.selectbox("View:", ["Stock", "Sector"], index=0, key="alloc", label_visibility="collapsed")
-                            if allocation_type == "Stock":
-                                fig_pie = px.pie(df_valid, values='value', names='stock_name', title="Stock Allocation",
-                                                 color='symbol', color_discrete_map=stock_colors)
+        elif option == "View Other Portfolio":
+            with st.form("view_form"):
+                view_username = st.text_input("Enter Username to View")
+                if st.form_submit_button("View"):
+                    conn = get_db_connection()
+                    if conn:
+                        try:
+                            c = conn.cursor()
+                            c.execute("SELECT username FROM users WHERE username=%s", (view_username,))
+                            if c.fetchone():
+                                st.session_state.view_mode = True
+                                st.session_state.view_username = view_username
+                                st.success(f"Viewing {view_username}'s portfolio.")
+                                st.rerun()
                             else:
-                                sector_values = df_valid.groupby('sector')['value'].sum().reset_index()
-                                fig_pie = px.pie(sector_values, values='value', names='sector', title="Sector Diversification",
-                                                 color_discrete_sequence=px.colors.qualitative.Plotly)
-                            fig_pie.update_layout(template=custom_template, height=400)
-                            st.plotly_chart(fig_pie, use_container_width=True)
-                            st.markdown("""
-                                <style>
-                                div[data-testid="stSelectbox"]:nth-child(2) {
-                                    position: absolute;
-                                    bottom: 10px;
-                                    right: 10px;
-                                    width: 100px;
-                                }
-                                </style>
-                                """, unsafe_allow_html=True)
+                                st.error("Username not found.")
+                        finally:
+                            conn.close()
 
-                        # Graph 2: Stock Performance
-                        with col2:
-                            st.subheader("Stock Performance")
-                            fig_bar = px.bar(df_valid, x='stock_name', y='return_percentage', title="Stock Returns (%)",
-                                             labels={'return_percentage': 'Return (%)'}, color='symbol',
-                                             color_discrete_map=stock_colors)
-                            fig_bar.update_traces(width=0.5)
-                            if len(df_valid) > 4:
-                                fig_bar.update_layout(xaxis=dict(autorange=False, range=[-0.5, 3.5], rangeslider_visible=True))
-                            fig_bar.update_layout(template=custom_template, height=400)
-                            st.plotly_chart(fig_bar, use_container_width=True)
+    # Authenticated or View Mode
+    else:
+        current_user = st.session_state.username if st.session_state.authenticated else st.session_state.view_username
+        st.title(f"Stock Portfolio Tracker - {current_user}{' (View Only)' if st.session_state.view_mode else ''}")
 
-                        # Graph 3: Portfolio vs NIFTY 50 Returns
-                        st.subheader("Portfolio vs NIFTY 50 Returns (1-Year)")
-                        start_date = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
-                        end_date = datetime.today().strftime('%Y-%m-%d')
-                        portfolio_df = calculate_portfolio_return(df_transactions, start_date, end_date)
-                        if not portfolio_df.empty and len(portfolio_df['Date'].unique()) > 1:
-                            fig_portfolio = go.Figure()
-                            portfolio_data = portfolio_df[portfolio_df['Type'] == 'Portfolio']
-                            nifty_data = portfolio_df[portfolio_df['Type'] == 'NIFTY 50']
+        # Navigation
+        if st.session_state.authenticated:
+            col1, col2, col3, col4, col5, col6, col7 = st.columns([1, 1, 1, 1, 1, 1, 0.5])
+            with col1:
+                dashboard_clicked = st.button("Dashboard")
+            with col2:
+                stock_activity_clicked = st.button("Stock Activity Ledger")
+            with col3:
+                fund_monitor_clicked = st.button("Fund Monitor")
+            with col4:
+                unrealized_pl_clicked = st.button("Unrealized P/L")
+            with col5:
+                realized_pl_clicked = st.button("Realized P/L")
+            with col6:
+                add_clicked = st.button("Add")
+            with col7:
+                if 'refreshing' not in st.session_state:
+                    st.session_state.refreshing = False
+                refresh_clicked = st.button("🔄", key="refresh_button")
+                if refresh_clicked:
+                    st.session_state.refreshing = True
+                    with st.spinner("Refreshing data..."):
+                        st.cache_data.clear()
+                        st.rerun()
+                    st.session_state.refreshing = False
+        else:
+            col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
+            with col1:
+                dashboard_clicked = st.button("Dashboard")
+            with col2:
+                stock_activity_clicked = st.button("Stock Activity Ledger")
+            with col3:
+                fund_monitor_clicked = st.button("Fund Monitor")
+            with col4:
+                unrealized_pl_clicked = st.button("Unrealized P/L")
+            with col5:
+                realized_pl_clicked = st.button("Realized P/L")
 
-                            fig_portfolio.add_trace(go.Scatter(
-                                x=portfolio_data['Date'],
-                                y=portfolio_data['Return %'],
-                                mode='lines',
-                                name='Portfolio',
-                                line_color='#00CC96',
-                                customdata=nifty_data['Return %'].reindex(portfolio_data.index, method='ffill'),
-                                hovertemplate='<b>Date</b>: %{x}<br><b>Portfolio Return</b>: %{y:.2f}%<br><b>NIFTY 50 Return</b>: %{customdata:.2f}%'
-                            ))
+        # CSS for spinning refresh button (authenticated users only)
+        if st.session_state.authenticated:
+            st.markdown("""
+                <style>
+                button[kind="primary"][key="refresh_button"] {
+                    transition: transform 0.5s;
+                }
+                button[kind="primary"][key="refresh_button"]:active {
+                    transform: rotate(360deg);
+                }
+                </style>
+            """, unsafe_allow_html=True)
 
-                            if not nifty_data.empty:
+        # Handle Navigation
+        if dashboard_clicked:
+            st.session_state.view = "Dashboard"
+            st.session_state.show_sidebar = False
+        elif stock_activity_clicked:
+            st.session_state.view = "Stock Activity Ledger"
+            st.session_state.show_sidebar = False
+        elif fund_monitor_clicked:
+            st.session_state.view = "Fund Monitor"
+            st.session_state.show_sidebar = False
+        elif unrealized_pl_clicked:
+            st.session_state.view = "Unrealized P/L"
+            st.session_state.show_sidebar = False
+        elif realized_pl_clicked:
+            st.session_state.view = "Realized P/L"
+            st.session_state.show_sidebar = False
+        elif 'add_clicked' in locals() and add_clicked:
+            current_state = st.session_state.show_sidebar
+            st.session_state.show_sidebar = not current_state
+
+        # Fetch User-Specific Data
+        conn = get_db_connection()
+        if conn:
+            try:
+                df_stocks = pd.read_sql_query("SELECT * FROM stocks WHERE username=%s", conn, params=(current_user,))
+                df_transactions = pd.read_sql_query("SELECT * FROM transactions WHERE username=%s", conn, params=(current_user,))
+                df_broker = pd.read_sql_query("SELECT * FROM broker_transactions WHERE username=%s", conn, params=(current_user,))
+            except Exception as e:
+                st.error(f"Error fetching data: {str(e)}")
+                df_stocks = pd.DataFrame(columns=['username', 'stock_name', 'symbol', 'exchange', 'purchase_price', 'quantity', 'total_cost'])
+                df_transactions = pd.DataFrame(columns=['username', 'stock_name', 'symbol', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity'])
+                df_broker = pd.DataFrame(columns=['username', 'transaction_type', 'date', 'amount'])
+            finally:
+                conn.close()
+        else:
+            df_stocks = pd.DataFrame(columns=['username', 'stock_name', 'symbol', 'exchange', 'purchase_price', 'quantity', 'total_cost'])
+            df_transactions = pd.DataFrame(columns=['username', 'stock_name', 'symbol', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity'])
+            df_broker = pd.DataFrame(columns=['username', 'transaction_type', 'date', 'amount'])
+
+        # Sidebar (Authenticated Users Only)
+        if st.session_state.authenticated and st.session_state.show_sidebar:
+            with st.sidebar:
+                with st.expander("Add Transactions", expanded=True):
+                    add_stock_transaction_form(current_user)
+                    st.markdown("---")
+                    add_broker_transaction_form(current_user)
+                st.write(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Password Setup for Clear All (Authenticated Users Only)
+        if st.session_state.authenticated:
+            clear_password = get_clear_password(current_user)
+            if not clear_password:
+                with st.form("set_password_form"):
+                    new_password = st.text_input("Set a password to protect 'Clear All'", type="password")
+                    if st.form_submit_button("Set Password"):
+                        if new_password:
+                            set_clear_password(current_user, new_password)
+                            st.success("Password set successfully!")
+                            st.rerun()
+                        else:
+                            st.error("Password cannot be empty.")
+            else:
+                if not st.session_state.is_unlocked:
+                    with st.form("unlock_form"):
+                        password_input = st.text_input("Enter password to unlock 'Clear All'", type="password")
+                        if st.form_submit_button("Unlock"):
+                            if password_input == clear_password:
+                                st.session_state.is_unlocked = True
+                                st.success("Unlocked successfully!")
+                                st.rerun()
+                            else:
+                                st.error("Incorrect password.")
+                else:
+                    if st.button("Lock"):
+                        st.session_state.is_unlocked = False
+                        st.success("Locked again!")
+                        st.rerun()
+
+        # Color Mapping for Stocks
+        if not df_stocks.empty and 'symbol' in df_stocks.columns:
+            stock_colors = {symbol: px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
+                            for i, symbol in enumerate(df_stocks['symbol'].unique())}
+        else:
+            stock_colors = {}
+
+        with st.container():
+            if st.session_state.view == "Dashboard":
+                if not df_stocks.empty:
+                    df_current_stocks = df_stocks[df_stocks['quantity'] > 0].copy()
+                    if not df_current_stocks.empty:
+                        with st.spinner("Updating Prices..."):
+                            prices = [fetch_data(symbol) for symbol in df_current_stocks['symbol']]
+                            df_current_stocks['current_price'] = prices
+
+                        df_valid = df_current_stocks.dropna(subset=['current_price']).copy()
+                        if not df_valid.empty:
+                            df_valid['value'] = df_valid['current_price'] * df_valid['quantity']
+                            df_valid['unrealized_pl'] = (df_valid['current_price'] - df_valid['purchase_price']) * df_valid['quantity']
+                            df_valid['return_percentage'] = df_valid.apply(
+                                lambda row: (row['unrealized_pl'] / row['total_cost'] * 100) if row['total_cost'] > 0 else 0, axis=1)
+                            df_valid['sector'] = [yf.Ticker(symbol).info.get('sector', 'Unknown') for symbol in df_valid['symbol']]
+
+                            total_investment = df_valid['total_cost'].sum()
+                            total_value = df_valid['value'].sum()
+                            total_unrealized_pl = df_valid['unrealized_pl'].sum()
+                            realized_pl = calculate_realized_profit_loss(df_transactions)
+                            one_day_change, one_day_change_pct = calculate_one_day_change(df_valid)
+
+                            # Metrics
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                            col1.metric("Total Investment", f"₹{total_investment:.2f}")
+                            col2.metric("Current Value", f"₹{total_value:.2f}")
+                            col3.metric("1-Day Change", f"₹{one_day_change:.2f}" if one_day_change is not None else "N/A",
+                                        f"{one_day_change_pct:.2f}%" if one_day_change_pct is not None else "N/A",
+                                        delta_color="normal" if one_day_change is None or one_day_change >= 0 else "inverse")
+                            col4.metric("Return", f"₹{total_unrealized_pl:.2f}",
+                                        f"{(total_unrealized_pl / total_investment) * 100:.2f}%" if total_investment > 0 else "N/A")
+                            col5.metric("Realized P/L", f"₹{realized_pl:.2f}")
+
+                            # Graphs
+                            col1, col2 = st.columns(2)
+
+                            # Graph 1: Portfolio Allocation
+                            with col1:
+                                st.subheader("Portfolio Allocation")
+                                allocation_type = st.selectbox("View:", ["Stock", "Sector"], index=0, key="alloc", label_visibility="collapsed")
+                                if allocation_type == "Stock":
+                                    fig_pie = px.pie(df_valid, values='value', names='stock_name', title="Stock Allocation",
+                                                     color='symbol', color_discrete_map=stock_colors)
+                                else:
+                                    sector_values = df_valid.groupby('sector')['value'].sum().reset_index()
+                                    fig_pie = px.pie(sector_values, values='value', names='sector', title="Sector Diversification",
+                                                     color_discrete_sequence=px.colors.qualitative.Plotly)
+                                fig_pie.update_layout(template=custom_template, height=400)
+                                st.plotly_chart(fig_pie, use_container_width=True)
+                                st.markdown("""
+                                    <style>
+                                    div[data-testid="stSelectbox"]:nth-child(2) {
+                                        position: absolute;
+                                        bottom: 10px;
+                                        right: 10px;
+                                        width: 100px;
+                                    }
+                                    </style>
+                                    """, unsafe_allow_html=True)
+
+                            # Graph 2: Stock Performance
+                            with col2:
+                                st.subheader("Stock Performance")
+                                fig_bar = px.bar(df_valid, x='stock_name', y='return_percentage', title="Stock Returns (%)",
+                                                 labels={'return_percentage': 'Return (%)'}, color='symbol',
+                                                 color_discrete_map=stock_colors)
+                                fig_bar.update_traces(width=0.5)
+                                if len(df_valid) > 4:
+                                    fig_bar.update_layout(xaxis=dict(autorange=False, range=[-0.5, 3.5], rangeslider_visible=True))
+                                fig_bar.update_layout(template=custom_template, height=400)
+                                st.plotly_chart(fig_bar, use_container_width=True)
+
+                            # Graph 3: Portfolio vs NIFTY 50 Returns
+                            st.subheader("Portfolio vs NIFTY 50 Returns (1-Year)")
+                            start_date = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
+                            end_date = datetime.today().strftime('%Y-%m-%d')
+                            portfolio_df = calculate_portfolio_return(df_transactions, start_date, end_date)
+                            if not portfolio_df.empty and len(portfolio_df['Date'].unique()) > 1:
+                                fig_portfolio = go.Figure()
+                                portfolio_data = portfolio_df[portfolio_df['Type'] == 'Portfolio']
+                                nifty_data = portfolio_df[portfolio_df['Type'] == 'NIFTY 50']
+
                                 fig_portfolio.add_trace(go.Scatter(
-                                    x=nifty_data['Date'],
-                                    y=nifty_data['Return %'],
+                                    x=portfolio_data['Date'],
+                                    y=portfolio_data['Return %'],
                                     mode='lines',
-                                    name='NIFTY 50',
-                                    line_color='#EF553B',
-                                    customdata=portfolio_data['Return %'].reindex(nifty_data.index, method='ffill'),
-                                    hovertemplate='<b>Date</b>: %{x}<br><b>Portfolio Return</b>: %{customdata:.2f}%<br><b>NIFTY 50 Return</b>: %{y:.2f}%'
+                                    name='Portfolio',
+                                    line_color='#00CC96',
+                                    customdata=nifty_data['Return %'].reindex(portfolio_data.index, method='ffill'),
+                                    hovertemplate='<b>Date</b>: %{x}<br><b>Portfolio Return</b>: %{y:.2f}%<br><b>NIFTY 50 Return</b>: %{customdata:.2f}%'
                                 ))
 
-                            fig_portfolio.update_layout(
-                                title="Portfolio vs NIFTY 50 Returns (1-Year)",
-                                yaxis_title="Return (%)",
-                                template=custom_template,
-                                legend=dict(x=0.01, y=0.99),
-                                hovermode='x unified'
-                            )
-                            st.plotly_chart(fig_portfolio, use_container_width=True)
-                        else:
-                            st.warning("Insufficient data to plot Portfolio vs NIFTY 50 returns.")
+                                if not nifty_data.empty:
+                                    fig_portfolio.add_trace(go.Scatter(
+                                        x=nifty_data['Date'],
+                                        y=nifty_data['Return %'],
+                                        mode='lines',
+                                        name='NIFTY 50',
+                                        line_color='#EF553B',
+                                        customdata=portfolio_data['Return %'].reindex(nifty_data.index, method='ffill'),
+                                        hovertemplate='<b>Date</b>: %{x}<br><b>Portfolio Return</b>: %{customdata:.2f}%<br><b>NIFTY 50 Return</b>: %{y:.2f}%'
+                                    ))
 
-                        # Graph 4: Risk Analysis
-                        st.subheader("Risk Analysis")
-                        graph4_options = ["Volatility vs. Return (Scatter)", "Price Change Distribution (Histogram)"]
-                        graph4_type = st.selectbox("Select Graph Type:", graph4_options, key="graph4")
-                        if graph4_type == "Volatility vs. Return (Scatter)":
-                            volatility_return_df = calculate_volatility_return(df_valid)
-                            if not volatility_return_df.empty:
-                                fig_scatter = px.scatter(volatility_return_df, x="Volatility (%)", y="Return (%)",
-                                                         size="Value (₹)", color="Symbol", text="Stock Name",
-                                                         title="Volatility vs. Return (1-Year)",
-                                                         color_discrete_map=stock_colors,
-                                                         hover_data={"Value (₹)": ":.2f"})
-                                fig_scatter.update_traces(textposition='top center')
-                                fig_scatter.update_layout(template=custom_template, height=400)
-                                st.plotly_chart(fig_scatter, use_container_width=True)
-                            else:
-                                st.warning("Insufficient data for Volatility vs. Return plot.")
-                        elif graph4_type == "Price Change Distribution (Histogram)":
-                            stock_options = [f"{row['stock_name']} ({row['symbol']})" for _, row in df_valid.iterrows()]
-                            selected_stock = st.selectbox("Select Stock:", stock_options, key="hist_stock")
-                            selected_symbol = selected_stock.split(" (")[1][:-1]
-                            hist_df = calculate_price_change_distribution(selected_symbol, start_date, end_date)
-                            if hist_df is not None:
-                                fig_hist = px.histogram(hist_df, x="Price Change (%)", nbins=50,
-                                                        title=f"Price Change Distribution: {selected_stock}",
-                                                        color_discrete_sequence=[stock_colors.get(selected_symbol, '#636EFA')])
-                                fig_hist.update_layout(template=custom_template, height=400, bargap=0.2)
-                                st.plotly_chart(fig_hist, use_container_width=True)
-                            else:
-                                st.warning("Insufficient data for Price Change Distribution.")
-
-                        # Graph 5: Historical Price Trend with Volume (Candlestick)
-                        st.subheader("Technical Analysis")
-                        stock_options = [f"{row['stock_name']} ({row['symbol']})" for _, row in df_valid.iterrows()]
-                        selected_stock = st.selectbox("Stock for Candlestick:", stock_options, key="price")
-                        selected_symbol = selected_stock.split(" (")[1][:-1]
-                        hist_df = fetch_historical_data(selected_symbol, start_date, end_date, include_volume=True)
-                        if hist_df is not None:
-                            fig_candle = go.Figure()
-                            fig_candle.add_trace(go.Bar(x=hist_df['Date'], y=hist_df['Volume'], name='Volume', opacity=0.5, yaxis='y2', marker_color='#636EFA'))
-                            fig_candle.add_trace(go.Candlestick(x=hist_df['Date'], open=hist_df['Open'], high=hist_df['High'],
-                                                                low=hist_df['Low'], close=hist_df['Close'], name='Price',
-                                                                increasing_line_color='#00CC96', decreasing_line_color='#EF553B'))
-                            fig_candle.update_layout(title=f"Candlestick: {selected_stock} (1-Year)", yaxis_title="Price (₹)",
-                                                     yaxis2=dict(title="Volume", overlaying='y', side='right'),
-                                                     template=custom_template, legend=dict(x=0.01, y=0.99))
-                            st.plotly_chart(fig_candle, use_container_width=True)
-
-                        # Graph 6: RSI Trend
-                        selected_rsi_stock = st.selectbox("Stock for RSI:", stock_options, key="rsi")
-                        selected_symbol = selected_rsi_stock.split(" (")[1][:-1]
-                        hist_df = fetch_historical_data(selected_symbol, start_date, end_date)
-                        if hist_df is not None:
-                            hist_df['RSI'] = calculate_rsi(hist_df)
-                            fig_rsi = go.Figure()
-                            for i in range(1, len(hist_df)):
-                                color = '#FFFFFF' if 30 <= hist_df['RSI'].iloc[i] <= 70 else '#EF553B' if hist_df['RSI'].iloc[i] > 70 else '#00CC96'
-                                fig_rsi.add_trace(go.Scatter(x=[hist_df['Date'].iloc[i-1], hist_df['Date'].iloc[i]],
-                                                             y=[hist_df['RSI'].iloc[i-1], hist_df['RSI'].iloc[i]],
-                                                             mode='lines', line=dict(color=color), showlegend=False))
-                            fig_rsi.add_hline(y=70, line_dash="dash", line_color="#EF553B", annotation_text="Overbought")
-                            fig_rsi.add_hline(y=30, line_dash="dash", line_color="#00CC96", annotation_text="Oversold")
-                            fig_rsi.update_layout(title=f"RSI: {selected_rsi_stock}", yaxis_title="RSI", template=custom_template)
-                            st.plotly_chart(fig_rsi, use_container_width=True)
-
-                        # Graph 7: Bollinger Bands
-                        st.subheader("Bollinger Bands")
-                        selected_bb_stock = st.selectbox("Stock for Bollinger Bands:", stock_options, key="bb")
-                        selected_symbol = selected_bb_stock.split(" (")[1][:-1]
-                        hist_df = fetch_historical_data(selected_symbol, start_date, end_date)
-                        if hist_df is not None:
-                            sma_options = [5, 10, 20, 50, 100]
-                            sma_period = st.selectbox("SMA Period:", sma_options, index=2, key="bb_sma")
-                            hist_df = calculate_bollinger_bands(hist_df, period=sma_period)
-                            fig_bb = go.Figure()
-                            fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Close'], name='Price', line_color='#00CC96',
-                                                        hovertemplate='Date: %{x}<br>Price: ₹%{y:.2f}<br>SMA: ₹%{customdata[0]:.2f}<br>Upper: ₹%{customdata[1]:.2f}<br>Lower: ₹%{customdata[2]:.2f}',
-                                                        customdata=hist_df[['SMA', 'Upper Band', 'Lower Band']]))
-                            fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Upper Band'], name='Upper', line=dict(dash='dash', color='#EF553B')))
-                            fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Lower Band'], name='Lower', line=dict(dash='dash', color='#00CC96')))
-                            fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['SMA'], name=f'SMA-{sma_period}', line_color='#FFFF00'))
-                            fig_bb.update_layout(title=f"Bollinger Bands: {selected_bb_stock}", yaxis_title="Price (₹)",
-                                                 template=custom_template, legend=dict(x=0.01, y=0.99))
-                            st.plotly_chart(fig_bb, use_container_width=True)
-
-                        # Graph 8: P/E Ratio Trend
-                        st.subheader("P/E Ratio Trend")
-                        selected_pe_stock = st.selectbox("Stock for P/E Trend:", stock_options, key="pe")
-                        selected_symbol = selected_pe_stock.split(" (")[1][:-1]
-                        hist_pe_df = fetch_historical_pe(selected_symbol, start_date, end_date)
-                        if hist_pe_df is not None:
-                            fig_pe_trend = px.line(hist_pe_df, x='Date', y='P/E Ratio', title=f"P/E Trend: {selected_pe_stock}",
-                                                   color_discrete_sequence=[stock_colors.get(selected_symbol, '#636EFA')])
-                            fig_pe_trend.add_hline(y=20, line_dash="dash", line_color="#FFFF00", annotation_text="Avg")
-                            fig_pe_trend.update_layout(
-                                template=custom_template,
-                                height=400,
-                                yaxis=dict(
-                                    dtick=10,
-                                    range=[0, max(50, hist_pe_df['P/E Ratio'].max() * 1.1)]
+                                fig_portfolio.update_layout(
+                                    title="Portfolio vs NIFTY 50 Returns (1-Year)",
+                                    yaxis_title="Return (%)",
+                                    template=custom_template,
+                                    legend=dict(x=0.01, y=0.99),
+                                    hovermode='x unified'
                                 )
-                            )
-                            st.plotly_chart(fig_pe_trend, use_container_width=True)
-
-                        # Graph 9: Portfolio Insights
-                        st.subheader("Portfolio Insights")
-                        graph9_options = ["Profit/Loss Breakdown (Waterfall)", "Correlation Matrix (Heatmap)"]
-                        graph9_type = st.selectbox("Select Graph Type:", graph9_options, key="graph9")
-                        if graph9_type == "Profit/Loss Breakdown (Waterfall)":
-                            pl_df = calculate_pl_breakdown(df_valid)
-                            fig_waterfall = go.Figure(go.Waterfall(
-                                name="P/L", orientation="v",
-                                x=pl_df['Stock Name'], y=pl_df['Unrealized P/L (₹)'],
-                                text=[f"₹{val:.2f}" for val in pl_df['Unrealized P/L (₹)']],
-                                textposition="auto",
-                                connector={"line": {"color": "rgb(63, 63, 63)"}},
-                            ))
-                            fig_waterfall.update_layout(
-                                title="Unrealized Profit/Loss Breakdown",
-                                yaxis_title="P/L (₹)",
-                                template=custom_template,
-                                height=400
-                            )
-                            st.plotly_chart(fig_waterfall, use_container_width=True)
-                        elif graph9_type == "Correlation Matrix (Heatmap)":
-                            corr_matrix = calculate_correlation_matrix(df_valid)
-                            if corr_matrix is not None:
-                                fig_heatmap = px.imshow(corr_matrix, text_auto=".2f",
-                                                        title="Stock Correlation Matrix",
-                                                        color_continuous_scale="RdBu_r",
-                                                        range_color=[-1, 1])
-                                fig_heatmap.update_layout(template=custom_template, height=400)
-                                st.plotly_chart(fig_heatmap, use_container_width=True)
+                                st.plotly_chart(fig_portfolio, use_container_width=True)
                             else:
-                                st.warning("Need at least 2 stocks with sufficient data for correlation matrix.")
+                                st.warning("Insufficient data to plot Portfolio vs NIFTY 50 returns.")
 
-                        # Clear All with Password Lock
-                        st.subheader("Clear Data")
-                        if st.session_state.clear_password:
-                            if not st.session_state.is_unlocked:
-                                with st.form("unlock_form"):
-                                    password_input = st.text_input("Enter password to unlock 'Clear All'", type="password")
-                                    if st.form_submit_button("Unlock"):
-                                        if password_input == st.session_state.clear_password:
-                                            st.session_state.is_unlocked = True
-                                            st.success("Unlocked successfully!")
-                                            st.rerun()
-                                        else:
-                                            st.error("Incorrect password.")
-                            else:
-                                if st.button("Clear All Data"):
-                                    conn = get_db_connection()
-                                    if conn:
-                                        try:
-                                            c = conn.cursor()
-                                            c.execute("DELETE FROM transactions")
-                                            c.execute("DELETE FROM stocks")
-                                            c.execute("DELETE FROM broker_transactions")
-                                            conn.commit()
-                                            st.success("Data cleared!")
-                                            st.session_state.is_unlocked = False
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error clearing data: {str(e)}")
-                                        finally:
-                                            conn.close()
-                                if st.button("Lock"):
-                                    st.session_state.is_unlocked = False
-                                    st.success("Locked again!")
-                                    st.rerun()
+                            # Graph 4: Risk Analysis
+                            st.subheader("Risk Analysis")
+                            graph4_options = ["Volatility vs. Return (Scatter)", "Price Change Distribution (Histogram)"]
+                            graph4_type = st.selectbox("Select Graph Type:", graph4_options, key="graph4")
+                            if graph4_type == "Volatility vs. Return (Scatter)":
+                                volatility_return_df = calculate_volatility_return(df_valid)
+                                if not volatility_return_df.empty:
+                                    fig_scatter = px.scatter(volatility_return_df, x="Volatility (%)", y="Return (%)",
+                                                             size="Value (₹)", color="Symbol", text="Stock Name",
+                                                             title="Volatility vs. Return (1-Year)",
+                                                             color_discrete_map=stock_colors,
+                                                             hover_data={"Value (₹)": ":.2f"})
+                                    fig_scatter.update_traces(textposition='top center')
+                                    fig_scatter.update_layout(template=custom_template, height=400)
+                                    st.plotly_chart(fig_scatter, use_container_width=True)
+                                else:
+                                    st.warning("Insufficient data for Volatility vs. Return plot.")
+                            elif graph4_type == "Price Change Distribution (Histogram)":
+                                stock_options = [f"{row['stock_name']} ({row['symbol']})" for _, row in df_valid.iterrows()]
+                                selected_stock = st.selectbox("Select Stock:", stock_options, key="hist_stock")
+                                selected_symbol = selected_stock.split(" (")[1][:-1]
+                                hist_df = calculate_price_change_distribution(selected_symbol, start_date, end_date)
+                                if hist_df is not None:
+                                    fig_hist = px.histogram(hist_df, x="Price Change (%)", nbins=50,
+                                                            title=f"Price Change Distribution: {selected_stock}",
+                                                            color_discrete_sequence=[stock_colors.get(selected_symbol, '#636EFA')])
+                                    fig_hist.update_layout(template=custom_template, height=400, bargap=0.2)
+                                    st.plotly_chart(fig_hist, use_container_width=True)
+                                else:
+                                    st.warning("Insufficient data for Price Change Distribution.")
+
+                            # Graph 5: Historical Price Trend with Volume (Candlestick)
+                            st.subheader("Technical Analysis")
+                            stock_options = [f"{row['stock_name']} ({row['symbol']})" for _, row in df_valid.iterrows()]
+                            selected_stock = st.selectbox("Stock for Candlestick:", stock_options, key="price")
+                            selected_symbol = selected_stock.split(" (")[1][:-1]
+                            hist_df = fetch_historical_data(selected_symbol, start_date, end_date, include_volume=True)
+                            if hist_df is not None:
+                                fig_candle = go.Figure()
+                                fig_candle.add_trace(go.Bar(x=hist_df['Date'], y=hist_df['Volume'], name='Volume', opacity=0.5, yaxis='y2', marker_color='#636EFA'))
+                                fig_candle.add_trace(go.Candlestick(x=hist_df['Date'], open=hist_df['Open'], high=hist_df['High'],
+                                                                    low=hist_df['Low'], close=hist_df['Close'], name='Price',
+                                                                    increasing_line_color='#00CC96', decreasing_line_color='#EF553B'))
+                                fig_candle.update_layout(title=f"Candlestick: {selected_stock} (1-Year)", yaxis_title="Price (₹)",
+                                                         yaxis2=dict(title="Volume", overlaying='y', side='right'),
+                                                         template=custom_template, legend=dict(x=0.01, y=0.99))
+                                st.plotly_chart(fig_candle, use_container_width=True)
+
+                            # Graph 6: RSI Trend
+                            selected_rsi_stock = st.selectbox("Stock for RSI:", stock_options, key="rsi")
+                            selected_symbol = selected_rsi_stock.split(" (")[1][:-1]
+                            hist_df = fetch_historical_data(selected_symbol, start_date, end_date)
+                            if hist_df is not None:
+                                hist_df['RSI'] = calculate_rsi(hist_df)
+                                fig_rsi = go.Figure()
+                                for i in range(1, len(hist_df)):
+                                    color = '#FFFFFF' if 30 <= hist_df['RSI'].iloc[i] <= 70 else '#EF553B' if hist_df['RSI'].iloc[i] > 70 else '#00CC96'
+                                    fig_rsi.add_trace(go.Scatter(x=[hist_df['Date'].iloc[i-1], hist_df['Date'].iloc[i]],
+                                                                 y=[hist_df['RSI'].iloc[i-1], hist_df['RSI'].iloc[i]],
+                                                                 mode='lines', line=dict(color=color), showlegend=False))
+                                fig_rsi.add_hline(y=70, line_dash="dash", line_color="#EF553B", annotation_text="Overbought")
+                                fig_rsi.add_hline(y=30, line_dash="dash", line_color="#00CC96", annotation_text="Oversold")
+                                fig_rsi.update_layout(title=f"RSI: {selected_rsi_stock}", yaxis_title="RSI", template=custom_template)
+                                st.plotly_chart(fig_rsi, use_container_width=True)
+
+                            # Graph 7: Bollinger Bands
+                            st.subheader("Bollinger Bands")
+                            selected_bb_stock = st.selectbox("Stock for Bollinger Bands:", stock_options, key="bb")
+                            selected_symbol = selected_bb_stock.split(" (")[1][:-1]
+                            hist_df = fetch_historical_data(selected_symbol, start_date, end_date)
+                            if hist_df is not None:
+                                sma_options = [5, 10, 20, 50, 100]
+                                sma_period = st.selectbox("SMA Period:", sma_options, index=2, key="bb_sma")
+                                hist_df = calculate_bollinger_bands(hist_df, period=sma_period)
+                                fig_bb = go.Figure()
+                                fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Close'], name='Price', line_color='#00CC96',
+                                                            hovertemplate='Date: %{x}<br>Price: ₹%{y:.2f}<br>SMA: ₹%{customdata[0]:.2f}<br>Upper: ₹%{customdata[1]:.2f}<br>Lower: ₹%{customdata[2]:.2f}',
+                                                            customdata=hist_df[['SMA', 'Upper Band', 'Lower Band']]))
+                                fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Upper Band'], name='Upper', line=dict(dash='dash', color='#EF553B')))
+                                fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['Lower Band'], name='Lower', line=dict(dash='dash', color='#00CC96')))
+                                fig_bb.add_trace(go.Scatter(x=hist_df['Date'], y=hist_df['SMA'], name=f'SMA-{sma_period}', line_color='#FFFF00'))
+                                fig_bb.update_layout(title=f"Bollinger Bands: {selected_bb_stock}", yaxis_title="Price (₹)",
+                                                     template=custom_template, legend=dict(x=0.01, y=0.99))
+                                st.plotly_chart(fig_bb, use_container_width=True)
+
+                            # Graph 8: P/E Ratio Trend
+                            st.subheader("P/E Ratio Trend")
+                            selected_pe_stock = st.selectbox("Stock for P/E Trend:", stock_options, key="pe")
+                            selected_symbol = selected_pe_stock.split(" (")[1][:-1]
+                            hist_pe_df = fetch_historical_pe(selected_symbol, start_date, end_date)
+                            if hist_pe_df is not None:
+                                fig_pe_trend = px.line(hist_pe_df, x='Date', y='P/E Ratio', title=f"P/E Trend: {selected_pe_stock}",
+                                                       color_discrete_sequence=[stock_colors.get(selected_symbol, '#636EFA')])
+                                fig_pe_trend.add_hline(y=20, line_dash="dash", line_color="#FFFF00", annotation_text="Avg")
+                                fig_pe_trend.update_layout(
+                                    template=custom_template,
+                                    height=400,
+                                    yaxis=dict(
+                                        dtick=10,
+                                        range=[0, max(50, hist_pe_df['P/E Ratio'].max() * 1.1)]
+                                    )
+                                )
+                                st.plotly_chart(fig_pe_trend, use_container_width=True)
+
+                            # Graph 9: Portfolio Insights
+                            st.subheader("Portfolio Insights")
+                            graph9_options = ["Profit/Loss Breakdown (Waterfall)", "Correlation Matrix (Heatmap)"]
+                            graph9_type = st.selectbox("Select Graph Type:", graph9_options, key="graph9")
+                            if graph9_type == "Profit/Loss Breakdown (Waterfall)":
+                                pl_df = calculate_pl_breakdown(df_valid)
+                                fig_waterfall = go.Figure(go.Waterfall(
+                                    name="P/L", orientation="v",
+                                    x=pl_df['Stock Name'], y=pl_df['Unrealized P/L (₹)'],
+                                    text=[f"₹{val:.2f}" for val in pl_df['Unrealized P/L (₹)']],
+                                    textposition="auto",
+                                    connector={"line": {"color": "rgb(63, 63, 63)"}},
+                                ))
+                                fig_waterfall.update_layout(
+                                    title="Unrealized Profit/Loss Breakdown",
+                                    yaxis_title="P/L (₹)",
+                                    template=custom_template,
+                                    height=400
+                                )
+                                st.plotly_chart(fig_waterfall, use_container_width=True)
+                            elif graph9_type == "Correlation Matrix (Heatmap)":
+                                corr_matrix = calculate_correlation_matrix(df_valid)
+                                if corr_matrix is not None:
+                                    fig_heatmap = px.imshow(corr_matrix, text_auto=".2f",
+                                                            title="Stock Correlation Matrix",
+                                                            color_continuous_scale="RdBu_r",
+                                                            range_color=[-1, 1])
+                                    fig_heatmap.update_layout(template=custom_template, height=400)
+                                    st.plotly_chart(fig_heatmap, use_container_width=True)
+                                else:
+                                    st.warning("Need at least 2 stocks with sufficient data for correlation matrix.")
+
+                            # Clear All (Authenticated Users Only)
+                            if st.session_state.authenticated:
+                                st.subheader("Clear Data")
+                                if st.session_state.is_unlocked:
+                                    if st.button("Clear All Data"):
+                                        conn = get_db_connection()
+                                        if conn:
+                                            try:
+                                                c = conn.cursor()
+                                                c.execute("DELETE FROM transactions WHERE username=%s", (current_user,))
+                                                c.execute("DELETE FROM stocks WHERE username=%s", (current_user,))
+                                                c.execute("DELETE FROM broker_transactions WHERE username=%s", (current_user,))
+                                                conn.commit()
+                                                st.success("Data cleared!")
+                                                st.session_state.is_unlocked = False
+                                                st.rerun()
+                                            except Exception as e:
+                                                st.error(f"Error clearing data: {str(e)}")
+                                            finally:
+                                                conn.close()
+                        else:
+                            st.info("No current holdings with valid price data.")
                     else:
-                        st.info("No current holdings with valid price data.")
+                        st.info("No stocks currently held (quantity > 0).")
                 else:
-                    st.info("No stocks currently held (quantity > 0).")
-            else:
-                st.info("Add stocks to view your dashboard.")
+                    st.info("Add stocks to view your dashboard.")
 
-        elif st.session_state.view == "Stock Activity Ledger":
-            if not df_transactions.empty:
-                st.subheader("Stock Activity Ledger")
-                ledger_df = df_transactions.copy()
-                ledger_df['purchase_date'] = pd.to_datetime(ledger_df['purchase_date'])
-                ledger_df['Transaction Value'] = ledger_df.apply(
-                    lambda row: row['purchase_price'] * row['quantity'] if row['transaction_type'] == 'Buy' else -row['purchase_price'] * row['quantity'], axis=1)
-                realized_pl_col = []
-                for idx, row in ledger_df.iterrows():
-                    if row['transaction_type'] == 'Sell':
-                        symbol = row['symbol']
-                        buys = ledger_df[(ledger_df['symbol'] == symbol) & (ledger_df['transaction_type'] == 'Buy') & (ledger_df['purchase_date'] <= row['purchase_date'])]
-                        if not buys.empty:
-                            avg_buy_price = (buys['purchase_price'] * buys['quantity']).sum() / buys['quantity'].sum()
-                            realized_pl = (row['purchase_price'] - avg_buy_price) * row['quantity']
-                            realized_pl_col.append(realized_pl)
+            elif st.session_state.view == "Stock Activity Ledger":
+                if not df_transactions.empty:
+                    st.subheader("Stock Activity Ledger")
+                    ledger_df = df_transactions.copy()
+                    ledger_df['purchase_date'] = pd.to_datetime(ledger_df['purchase_date'])
+                    ledger_df['Transaction Value'] = ledger_df.apply(
+                        lambda row: row['purchase_price'] * row['quantity'] if row['transaction_type'] == 'Buy' else -row['purchase_price'] * row['quantity'], axis=1)
+                    realized_pl_col = []
+                    for idx, row in ledger_df.iterrows():
+                        if row['transaction_type'] == 'Sell':
+                            symbol = row['symbol']
+                            buys = ledger_df[(ledger_df['symbol'] == symbol) & (ledger_df['transaction_type'] == 'Buy') & (ledger_df['purchase_date'] <= row['purchase_date'])]
+                            if not buys.empty:
+                                avg_buy_price = (buys['purchase_price'] * buys['quantity']).sum() / buys['quantity'].sum()
+                                realized_pl = (row['purchase_price'] - avg_buy_price) * row['quantity']
+                                realized_pl_col.append(realized_pl)
+                            else:
+                                realized_pl_col.append(0)
                         else:
                             realized_pl_col.append(0)
-                    else:
-                        realized_pl_col.append(0)
-                ledger_df['Realized P/L (₹)'] = realized_pl_col
-                ledger_df = ledger_df[['symbol', 'stock_name', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity', 'Transaction Value', 'Realized P/L (₹)']]
-                ledger_df.columns = ['Symbol', 'Stock Name', 'Type', 'Exchange', 'Date', 'Price (₹)', 'Qty', 'Transaction Value (₹)', 'Realized P/L (₹)']
-                ledger_df = ledger_df.sort_values('Date', ascending=False)
-                styled_ledger = ledger_df.style.format({
-                    'Price (₹)': '₹{:.2f}',
-                    'Transaction Value (₹)': '₹{:.2f}',
-                    'Realized P/L (₹)': '₹{:.2f}'
-                }).applymap(color_transaction, subset=['Type']).applymap(color_pl, subset=['Realized P/L (₹)'])
-                st.dataframe(styled_ledger, use_container_width=True, height=400)
-                total_buys = ledger_df[ledger_df['Type'] == 'Buy']['Transaction Value (₹)'].sum()
-                total_sells = -ledger_df[ledger_df['Type'] == 'Sell']['Transaction Value (₹)'].sum()
-                net_investment = total_buys - total_sells
-                st.write(f"**Summary:** Total Buys: ₹{total_buys:.2f} | Total Sells: ₹{total_sells:.2f} | Net Investment: ₹{net_investment:.2f}")
-            else:
-                st.info("No transactions yet.")
-
-        elif st.session_state.view == "Fund Monitor":
-            if not df_broker.empty:
-                st.subheader("Fund Monitor")
-                broker_df = df_broker.copy()
-                broker_df['date'] = pd.to_datetime(broker_df['date'])
-                broker_df['Deposit'] = broker_df.apply(lambda row: row['amount'] if row['transaction_type'] == 'Deposit' else 0, axis=1)
-                broker_df['Withdraw'] = broker_df.apply(lambda row: row['amount'] if row['transaction_type'] == 'Withdraw' else 0, axis=1)
-                broker_df = broker_df[['transaction_type', 'date', 'Deposit', 'Withdraw']]
-                broker_df.columns = ['Type', 'Date', 'Deposit (₹)', 'Withdraw (₹)']
-                broker_df = broker_df.sort_values('Date', ascending=False)
-                styled_broker = broker_df.style.format({'Deposit (₹)': '₹{:.2f}', 'Withdraw (₹)': '₹{:.2f}'}).applymap(color_fund, subset=['Type'])
-                st.dataframe(styled_broker, use_container_width=True, height=400)
-                total_deposits = broker_df['Deposit (₹)'].sum()
-                total_withdrawals = broker_df['Withdraw (₹)'].sum()
-                net_balance = total_deposits - total_withdrawals
-                st.write(f"**Summary:** Total Deposits: ₹{total_deposits:.2f} | Total Withdrawals: ₹{total_withdrawals:.2f} | Net Balance: ₹{net_balance:.2f}")
-            else:
-                st.info("No broker transactions yet.")
-
-        elif st.session_state.view == "Unrealized P/L":
-            if not df_stocks.empty:
-                df_current_stocks = df_stocks[df_stocks['quantity'] > 0].copy()
-                if not df_current_stocks.empty:
-                    with st.spinner("Updating Prices..."):
-                        prices = [fetch_data(symbol) for symbol in df_current_stocks['symbol']]
-                        df_current_stocks['current_price'] = prices
-
-                    df_valid = df_current_stocks.dropna(subset=['current_price']).copy()
-                    if not df_valid.empty:
-                        df_valid['value'] = df_valid['current_price'] * df_valid['quantity']
-                        df_valid['unrealized_pl'] = (df_valid['current_price'] - df_valid['purchase_price']) * df_valid['quantity']
-                        df_valid['return_percentage'] = df_valid.apply(
-                            lambda row: (row['unrealized_pl'] / row['total_cost'] * 100) if row['total_cost'] > 0 else 0, axis=1)
-                        df_valid['sector'] = [yf.Ticker(symbol).info.get('sector', 'Unknown') for symbol in df_valid['symbol']]
-
-                        st.subheader("Unrealized Profit/Loss")
-                        holdings_df = df_valid[['symbol', 'stock_name', 'quantity', 'current_price', 'value', 'purchase_price', 'unrealized_pl', 'return_percentage', 'sector', 'exchange']]
-                        holdings_df.columns = ['Symbol', 'Stock Name', 'Qty', 'Current Price (₹)', 'Value (₹)', 'Avg Buy Price (₹)', 'Return (₹)', 'Return %', 'Sector', 'Exchange']
-                        styled_df = holdings_df.style.format({
-                            'Current Price (₹)': '₹{:.2f}',
-                            'Value (₹)': '₹{:.2f}',
-                            'Avg Buy Price (₹)': '₹{:.2f}',
-                            'Return (₹)': '₹{:.2f}',
-                            'Return %': '{:.2f}%'
-                        }).applymap(color_pl, subset=['Return (₹)', 'Return %'])
-                        st.dataframe(styled_df, use_container_width=True)
-                        if st.download_button("Export Holdings", holdings_df.to_csv(index=False), "holdings.csv"):
-                            st.success("Holdings exported!")
-                    else:
-                        st.info("No current holdings with valid price data.")
-                else:
-                    st.info("No stocks currently held (quantity > 0).")
-            else:
-                st.info("Add stocks to view unrealized P/L.")
-
-        elif st.session_state.view == "Realized P/L":
-            if not df_transactions.empty:
-                st.subheader("Realized Profit/Loss")
-                realized_pl_df = calculate_realized_pl_table(df_transactions)
-                if not realized_pl_df.empty:
-                    realized_pl_df = realized_pl_df.sort_values('Date', ascending=False)
-                    styled_realized_pl = realized_pl_df.style.format({
+                    ledger_df['Realized P/L (₹)'] = realized_pl_col
+                    ledger_df = ledger_df[['symbol', 'stock_name', 'transaction_type', 'exchange', 'purchase_date', 'purchase_price', 'quantity', 'Transaction Value', 'Realized P/L (₹)']]
+                    ledger_df.columns = ['Symbol', 'Stock Name', 'Type', 'Exchange', 'Date', 'Price (₹)', 'Qty', 'Transaction Value (₹)', 'Realized P/L (₹)']
+                    ledger_df = ledger_df.sort_values('Date', ascending=False)
+                    styled_ledger = ledger_df.style.format({
                         'Price (₹)': '₹{:.2f}',
+                        'Transaction Value (₹)': '₹{:.2f}',
                         'Realized P/L (₹)': '₹{:.2f}'
                     }).applymap(color_transaction, subset=['Type']).applymap(color_pl, subset=['Realized P/L (₹)'])
-                    st.dataframe(styled_realized_pl, use_container_width=True, height=400)
-                    total_realized_pl = realized_pl_df['Realized P/L (₹)'].sum()
-                    st.write(f"**Total Realized P/L:** ₹{total_realized_pl:.2f}")
+                    st.dataframe(styled_ledger, use_container_width=True, height=400)
+                    total_buys = ledger_df[ledger_df['Type'] == 'Buy']['Transaction Value (₹)'].sum()
+                    total_sells = -ledger_df[ledger_df['Type'] == 'Sell']['Transaction Value (₹)'].sum()
+                    net_investment = total_buys - total_sells
+                    st.write(f"**Summary:** Total Buys: ₹{total_buys:.2f} | Total Sells: ₹{total_sells:.2f} | Net Investment: ₹{net_investment:.2f}")
                 else:
-                    st.info("No realized profit/loss from sales yet.")
-            else:
-                st.info("No transactions yet.")
+                    st.info("No transactions yet.")
+
+            elif st.session_state.view == "Fund Monitor":
+                if not df_broker.empty:
+                    st.subheader("Fund Monitor")
+                    broker_df = df_broker.copy()
+                    broker_df['date'] = pd.to_datetime(broker_df['date'])
+                    broker_df['Deposit'] = broker_df.apply(lambda row: row['amount'] if row['transaction_type'] == 'Deposit' else 0, axis=1)
+                    broker_df['Withdraw'] = broker_df.apply(lambda row: row['amount'] if row['transaction_type'] == 'Withdraw' else 0, axis=1)
+                    broker_df = broker_df[['transaction_type', 'date', 'Deposit', 'Withdraw']]
+                    broker_df.columns = ['Type', 'Date', 'Deposit (₹)', 'Withdraw (₹)']
+                    broker_df = broker_df.sort_values('Date', ascending=False)
+                    styled_broker = broker_df.style.format({'Deposit (₹)': '₹{:.2f}', 'Withdraw (₹)': '₹{:.2f}'}).applymap(color_fund, subset=['Type'])
+                    st.dataframe(styled_broker, use_container_width=True, height=400)
+                    total_deposits = broker_df['Deposit (₹)'].sum()
+                    total_withdrawals = broker_df['Withdraw (₹)'].sum()
+                    net_balance = total_deposits - total_withdrawals
+                    st.write(f"**Summary:** Total Deposits: ₹{total_deposits:.2f} | Total Withdrawals: ₹{total_withdrawals:.2f} | Net Balance: ₹{net_balance:.2f}")
+                else:
+                    st.info("No broker transactions yet.")
+
+            elif st.session_state.view == "Unrealized P/L":
+                if not df_stocks.empty:
+                    df_current_stocks = df_stocks[df_stocks['quantity'] > 0].copy()
+                    if not df_current_stocks.empty:
+                        with st.spinner("Updating Prices..."):
+                            prices = [fetch_data(symbol) for symbol in df_current_stocks['symbol']]
+                            df_current_stocks['current_price'] = prices
+
+                        df_valid = df_current_stocks.dropna(subset=['current_price']).copy()
+                        if not df_valid.empty:
+                            df_valid['value'] = df_valid['current_price'] * df_valid['quantity']
+                            df_valid['unrealized_pl'] = (df_valid['current_price'] - df_valid['purchase_price']) * df_valid['quantity']
+                            df_valid['return_percentage'] = df_valid.apply(
+                                lambda row: (row['unrealized_pl'] / row['total_cost'] * 100) if row['total_cost'] > 0 else 0, axis=1)
+                            df_valid['sector'] = [yf.Ticker(symbol).info.get('sector', 'Unknown') for symbol in df_valid['symbol']]
+
+                            st.subheader("Unrealized Profit/Loss")
+                            holdings_df = df_valid[['symbol', 'stock_name', 'quantity', 'current_price', 'value', 'purchase_price', 'unrealized_pl', 'return_percentage', 'sector', 'exchange']]
+                            holdings_df.columns = ['Symbol', 'Stock Name', 'Qty', 'Current Price (₹)', 'Value (₹)', 'Avg Buy Price (₹)', 'Return (₹)', 'Return %', 'Sector', 'Exchange']
+                            styled_df = holdings_df.style.format({
+                                'Current Price (₹)': '₹{:.2f}',
+                                'Value (₹)': '₹{:.2f}',
+                                'Avg Buy Price (₹)': '₹{:.2f}',
+                                'Return (₹)': '₹{:.2f}',
+                                'Return %': '{:.2f}%'
+                            }).applymap(color_pl, subset=['Return (₹)', 'Return %'])
+                            st.dataframe(styled_df, use_container_width=True)
+                            if st.download_button("Export Holdings", holdings_df.to_csv(index=False), "holdings.csv"):
+                                st.success("Holdings exported!")
+                        else:
+                            st.info("No current holdings with valid price data.")
+                    else:
+                        st.info("No stocks currently held (quantity > 0).")
+                else:
+                    st.info("Add stocks to view unrealized P/L.")
+
+            elif st.session_state.view == "Realized P/L":
+                if not df_transactions.empty:
+                    st.subheader("Realized Profit/Loss")
+                    realized_pl_df = calculate_realized_pl_table(df_transactions)
+                    if not realized_pl_df.empty:
+                        realized_pl_df = realized_pl_df.sort_values('Date', ascending=False)
+                        styled_realized_pl = realized_pl_df.style.format({
+                            'Price (₹)': '₹{:.2f}',
+                            'Realized P/L (₹)': '₹{:.2f}'
+                        }).applymap(color_transaction, subset=['Type']).applymap(color_pl, subset=['Realized P/L (₹)'])
+                        st.dataframe(styled_realized_pl, use_container_width=True, height=400)
+                        total_realized_pl = realized_pl_df['Realized P/L (₹)'].sum()
+                        st.write(f"**Total Realized P/L:** ₹{total_realized_pl:.2f}")
+                    else:
+                        st.info("No realized profit/loss from sales yet.")
+                else:
+                    st.info("No transactions yet.")
+
+        # Logout Button (Authenticated Users Only)
+        if st.session_state.authenticated:
+            if st.button("Logout"):
+                st.session_state.authenticated = False
+                st.session_state.username = None
+                st.session_state.view_mode = False
+                st.session_state.view_username = None
+                st.session_state.is_unlocked = False
+                st.rerun()
 
 if __name__ == "__main__":
     main()
