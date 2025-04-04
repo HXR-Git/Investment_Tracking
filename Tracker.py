@@ -38,7 +38,8 @@ custom_template = {
 
 # --- Database Setup ---
 def get_db_connection():
-    database_url = os.getenv("DATABASE_URL")
+    database_url = os.getenv("postgresql://postgres:ljndPuNyttPpSrAZCFVRQaGkAEViJuWU@crossover.proxy.rlwy.net:43960/railway")
+    #  postgresql://postgres:ljndPuNyttPpSrAZCFVRQaGkAEViJuWU@crossover.proxy.rlwy.net:43960/railway
     if not database_url:
         st.error("DATABASE_URL not set. Please configure it in your environment.")
         return None
